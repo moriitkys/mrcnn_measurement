@@ -1,0 +1,441 @@
+#!/usr/bin/env python
+# coding: utf-8
+'''
+Author: moriitkys, Akio Ochiai, Matterport Inc.
+forked from :
+    https://github.com/akio/mask_rcnn_ros
+License : MIT
+
+You can measure max & min diameters of inferenced objects by Mask RCNN.
+Recommended sensor : RealSense D435
+Usage : 
+    1, roslaunch realsense2_camera rs_aligned_depth.launch
+    2, roslaunch mrcnn_measurement mrcnn_measurement.launch
+    or
+    1, roscore
+    2, rosbag play -l snappeas_sample1.bag
+    3, roslaunch mrcnn_measurement mrcnn_measurement.launch (change <param name="~model" value="mymodel" />)
+'''
+import os
+import sys
+import threading
+from Queue import Queue
+import numpy as np
+import math
+
+import tensorflow as tf
+
+import cv2
+from cv_bridge import CvBridge
+from cv_bridge import CvBridgeError
+import rospy
+from sensor_msgs.msg import Image
+from sensor_msgs.msg import RegionOfInterest
+from sensor_msgs.msg import CameraInfo
+from std_msgs.msg import Int32MultiArray
+import message_filters
+
+import csv
+import time
+
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+
+# Root directory of the project
+ROOT_DIR = os.path.abspath("../")
+print(ROOT_DIR)
+# Import Mask RCNN
+sys.path.append(ROOT_DIR)  # To find local version of the library
+print(sys.path)
+
+from mrcnn_measurement import coco
+from mrcnn_measurement import utils
+from mrcnn_measurement import model as modellib
+from mrcnn_measurement import visualize
+from mrcnn_measurement.msg import Result
+
+
+class InferenceConfigCoco(coco.CocoConfig):
+    # Set batch size to 1 since we'll be running inference on
+    # one image at a time. Batch size = GPU_COUNT * IMAGES_PER_GPU
+    NAME = "coco"
+    GPU_COUNT = 1
+    IMAGES_PER_GPU = 1
+    NUM_CLASSES = 1 + 80  # COCO has 80 classes
+    IMAGE_MIN_DIM = 240
+    IMAGE_MAX_DIM = 320
+
+
+class InferenceConfigMymodel(coco.CocoConfig):
+    NAME = "mymodel"
+    GPU_COUNT = 1
+    IMAGES_PER_GPU = 1
+    NUM_CLASSES = 1 + 1
+    IMAGE_MIN_DIM = 480
+    IMAGE_MAX_DIM = 640
+
+
+class MaskRCNNNode(object):
+    def __init__(self):
+        # Local path to trained weights file
+        #path_ros_home = os.environ.get('ROS_HOME', os.path.join(os.environ['HOME'], '.ros'))
+        path_files = [s for s in sys.path if "mrcnn_measurement/scripts" in s][0]
+        path_files_h5 = path_files + "/files/mask_rcnn_coco.h5"
+        path_files_classes = path_files + '/files/mask_rcnn_coco_classes.csv'
+        config = InferenceConfigCoco()
+        #path_model_weights = os.path.join(path_ros_home, 'mask_rcnn_coco.h5')
+        self.class_names = []
+        with open(path_files_classes) as f:
+            reader = csv.reader(f)
+            self.class_names = [row[1] for row in reader]  # COCO Class names. Index of the class in the list is its ID.
+        
+        # img_sensor_size is the image size subscribed from your sensor
+        # img_input_size is the image size of deeplearning model input
+        self.img_sensor_size = [rospy.get_param('~img_sensor_size_0', True),
+                                rospy.get_param('~img_sensor_size_1', True)]  # [640, 480]
+        # print(self.img_sensor_size, type(self.img_sensor_size))
+        self.ratio_resize_input = float(1.0/2.0)  # COCO class
+
+        self.img_input_size = [int(self.img_sensor_size[0]*self.ratio_resize_input), int(self.img_sensor_size[1]*self.ratio_resize_input)]
+
+        # mask_size4diam is for calculating diameters (for mask & depth image)
+        self.ratio_resize_mask4diam = float(1.0/2.0)  # How mask image for calculating diameters shrink from a input image
+        self.mask_size4diam = [int(self.img_input_size[0]*self.ratio_resize_mask4diam), int(self.img_input_size[1]*self.ratio_resize_mask4diam)]
+
+        self.model_selected = rospy.get_param('~model', True)
+        if self.model_selected == "coco":
+            config = InferenceConfigCoco()
+            #path_model_weights = os.path.join(path_ros_home, 'mask_rcnn_coco.h5')
+            path_files_h5 = path_files + "/files/mask_rcnn_coco.h5"
+            path_files_classes = path_files + '/files/mask_rcnn_coco_classes.csv'
+            with open(path_files_classes) as f:
+                reader = csv.reader(f)
+                self.class_names = [row[1] for row in reader]  # COCO Class names. Index of the class in the list is its ID.
+                self.ratio_resize_input = float(1.0/2.0)  # Coco model
+                self.img_input_size = [int(self.img_sensor_size[0]*self.ratio_resize_input), int(self.img_sensor_size[1]*self.ratio_resize_input)]
+                # mask_size4diam is for calculating diameters (for mask & depth image)
+                self.ratio_resize_mask4diam = float(1.0/2.0)  # How mask image for calculating diameters shrink from a input image
+                self.mask_size4diam = [int(self.img_input_size[0]*self.ratio_resize_mask4diam), int(self.img_input_size[1]*self.ratio_resize_mask4diam)]
+                # Download COCO trained weights from Releases if needed
+            COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0/mask_rcnn_coco.h5"
+            if not os.path.exists(path_files_h5):
+                utils.download_trained_weights(path_files_h5, COCO_MODEL_URL)
+        elif self.model_selected == "mymodel":
+            config = InferenceConfigMymodel()
+            #path_model_weights = os.path.join(path_ros_home, 'mymodel.h5')
+            path_files_h5 = path_files + "/files/mymodel.h5"
+            path_files_classes = path_files + '/files/mymodel_classes.csv'
+            with open(path_files_classes) as f:
+                reader = csv.reader(f)
+                self.class_names = [row[1] for row in reader]
+                self.ratio_resize_input = float(1.0)  # My model
+                self.img_input_size = [int(self.img_sensor_size[0]*self.ratio_resize_input), int(self.img_sensor_size[1]*self.ratio_resize_input)]
+                # mask_size4diam is for calculating diameters (for mask & depth image)
+                self.ratio_resize_mask4diam = float(1.0/2.0)  # How mask image for calculating diameters shrink from a input image
+                self.mask_size4diam = [int(self.img_input_size[0]*self.ratio_resize_mask4diam), int(self.img_input_size[1]*self.ratio_resize_mask4diam)]
+
+            if not os.path.exists(path_files_h5):
+                print("PLEASE PUT mymodel_snappeas.h5 INTO /scripts/files")
+                #utils.download_trained_weights(path_files_h5, MY_MODEL_URL)
+        config.display()
+
+        # Create model object in inference mode.
+        self.model = modellib.MaskRCNN(mode="inference", model_dir="", config=config)
+
+        #self.model.load_weights(path_model_weights, by_name=True)
+        self.model.load_weights(path_files_h5, by_name=True)
+        # https://blog.csdn.net/Cyril__Li/article/details/79054596
+        self.graph = tf.get_default_graph()
+
+        # Publish topics
+        self.result_msg = Result()
+        self.pub_result = rospy.Publisher('/mrcnn/result', Result, queue_size=1)
+        self.class_colors = visualize.random_colors(len(self.class_names))
+        self.pub_visualize = rospy.Publisher('/mrcnn/visualization', Image, queue_size=1)
+
+        self.sub_cfg = rospy.Subscriber('/camera/color/camera_info', CameraInfo, self.camera_info_callback)
+
+        # message filters
+        self.sub_img = message_filters.Subscriber('/camera/color/image_raw', Image, queue_size=1, buff_size=2**24)
+        self.sub_dpt = message_filters.Subscriber('/camera/aligned_depth_to_color/image_raw', Image, queue_size=1, buff_size=2**24)
+        self.ts = message_filters.ApproximateTimeSynchronizer([self.sub_img, self.sub_dpt], 1, 0.1, allow_headerless=True)
+        self.ts.registerCallback(self.measurement_callback)
+
+        # Variables for measurement
+        # The length of array is equal to the sum of rois
+        self.points_diam_max = []
+        self.points_diam_min = []
+        self.diam_max = []
+        self.diam_min = []
+        # RealSense D435i camera parameter
+        self.fx = rospy.get_param('~fx', True)  # ex. my realsense) 613.3497314453125
+
+        # self.array_lines is used for calculate diameters at the center of the object gravity
+        # array_lines_shape is 2 times self.mask_size4diam because center is cog
+        array_lines_shape = [self.mask_size4diam[0] * 2, self.mask_size4diam[1] * 2]
+        self.angles = 180  # You can't change this
+        self.angle_step = 6  # The smaller self.angle_step is, the better the angular resolution
+        black = np.zeros((array_lines_shape[1], array_lines_shape[0], 3), np.uint8)
+        self.array_lines = np.array([[[0 for i in range(array_lines_shape[0])] for j in range(array_lines_shape[1])] for k in range(self.angles/self.angle_step)])
+        for i in range(0, self.angles/self.angle_step):
+            black = np.zeros((array_lines_shape[1], array_lines_shape[0], 3), np.uint8)
+            black = cv2.rectangle(black, (0, 0), (array_lines_shape[0], array_lines_shape[1]), (0, 0, 0), -1)
+            theta = (i*self.angle_step) * math.pi / 180.0
+            # Prepare white lines at each angle
+            x_ini = int(array_lines_shape[0]/2 + math.sqrt(2) * (array_lines_shape[0]/2) * math.cos(theta))
+            y_ini = int(array_lines_shape[1]/2 - math.sqrt(2) * (array_lines_shape[1]/2) * math.sin(theta))
+            x_end = int(array_lines_shape[0]/2 - math.sqrt(2) * (array_lines_shape[0]/2) * math.cos(theta))
+            y_end = int(array_lines_shape[1]/2 + math.sqrt(2) * (array_lines_shape[1]/2) * math.sin(theta))
+            img = cv2.line(black, (x_ini, y_ini), (x_end, y_end), (255, 255, 255), 1, cv2.LINE_4)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            self.array_lines[i] = img
+        self.number_loop = 0
+
+    def camera_info_callback(self, ci):
+        self.fx = ci.K[0]
+
+    def measurement_callback(self, img, dpt):
+        '''
+        If ROS Topic messages (color_image, depth_image) are received, callback.
+        1, Receive RGB image and Depth image topics
+        2, Inference (self.model.detect)
+        3, self.calculate_diameter (including publishing Result topic)
+        4, puclish visualization topic (publish_visualization())
+        '''
+        try:
+            cv_img = CvBridge().imgmsg_to_cv2(img, 'bgr8')
+            cv_dpt = CvBridge().imgmsg_to_cv2(dpt, 'passthrough')
+
+            h_img, w_img = cv_img.shape[:2]
+            h_dpt, w_dpt = cv_dpt.shape[:2]
+
+        except CvBridgeError, e:
+            print e
+
+        start = time.time()  # time measurement
+        if cv_img is not None:
+            np_image = cv_img.copy()  # img_input_size = [w=640,h=480]
+            np_depth = cv_dpt.copy()
+
+            np_image = cv2.resize(np_image, (self.img_input_size[0], self.img_input_size[1]))
+            np_depth = cv2.resize(np_depth, (self.img_input_size[0], self.img_input_size[1]))
+
+            # Run detection
+            with self.graph.as_default():
+                results = self.model.detect([np_image], verbose=0)
+            result = results[0]
+
+            self.calculate_diam(img, dpt, result)  # calculate max & min diameters of each object
+
+            self.pub_result.publish(self.result_msg)
+
+            # Visualize results
+            self.publish_visualization(np_image, result)
+        elapsed_time = time.time() - start
+        print("elapsed_time:{0}".format(elapsed_time) + "[sec]")
+
+    def build_result_msg_each_roi(self, img, result, i, y1, x1, y2, x2, max_diam, max_diam_coordinates, min_diam, min_diam_coordinates):
+        # Make result messages for each ROI
+        box = RegionOfInterest()
+        box.x_offset = np.asscalar(x1)
+        box.y_offset = np.asscalar(y1)
+        box.height = np.asscalar(y2 - y1)
+        box.width = np.asscalar(x2 - x1)
+        self.result_msg.boxes.append(box)
+
+        class_id = int(result['class_ids'][i])
+        self.result_msg.class_ids.append(class_id)
+
+        class_name = self.class_names[class_id]
+        self.result_msg.class_names.append(class_name)
+
+        score = result['scores'][i]
+        self.result_msg.scores.append(score)
+
+        mask = Image()
+        mask.header = img.header
+        mask.height = result['masks'].shape[0]
+        mask.width = result['masks'].shape[1]
+        mask.encoding = "mono8"
+        #mask.is_bigendian = False
+        mask.step = mask.width
+
+        mask.data = (result['masks'][:, :, i] * 255).tobytes()
+        self.result_msg.masks.append(mask)
+
+        self.result_msg.max_diam.append(max_diam)
+        max_diam_coordinates_topic = Int32MultiArray()
+        max_diam_coordinates_topic.data = [max_diam_coordinates[0][0], max_diam_coordinates[0][1], 
+                                           max_diam_coordinates[1][0], max_diam_coordinates[1][1]]
+        self.result_msg.max_diam_coordinates.append(max_diam_coordinates_topic)
+        
+        self.result_msg.min_diam.append(min_diam)
+        min_diam_coordinates_topic = Int32MultiArray()
+        min_diam_coordinates_topic.data = [min_diam_coordinates[0][0], min_diam_coordinates[0][1], 
+                                           min_diam_coordinates[1][0], min_diam_coordinates[1][1]]
+        self.result_msg.min_diam_coordinates.append(min_diam_coordinates_topic)
+
+    def reject_outliers(self, data, m=2.0):
+        # https://www.it-swarm-ja.tech/ja/python/%E3%83%AA%E3%82%B9%E3%83%88%E3%81%8B%E3%82%89%E5%A4%96%E3%82%8C%E5%80%A4%E3%82%92%E6%8B%92%E5%90%A6%E3%81%99%E3%82%8Bnumpy%E3%83%93%E3%83%AB%E3%83%88%E3%82%A4%E3%83%B3%E3%81%8C%E3%81%82%E3%82%8A%E3%81%BE%E3%81%99/1067915116/
+        return data[abs(data - np.mean(data)) < m * np.std(data)]
+
+    def map(self, x, in_min, in_max, out_min, out_max):
+        return (x-in_min) * (out_max-out_min) / (in_max-in_min) + out_min
+
+    def calculate_diam(self, img, dpt, result):
+        '''
+        Calculate diameter for each ROI and Publish Result topic.(Not visualization topic)
+        1, Extract the center of gravity and edge of mask from result['rois']
+        2, Multiply array lines and edge of mask at the center of gravity
+         -> We can get diameter_points ( (x, y) by np.where )
+        3, Calculate coordinates_max & coordinates_min from diameters_at_each_angle
+        '''
+        self.result_msg = Result()
+
+        # ----- 1, Extract the center of gravity and edge of mask from result['rois'] -----
+        cv_img = CvBridge().imgmsg_to_cv2(img, 'bgr8')  # if coco, size=[320,240]
+        cv_dpt = CvBridge().imgmsg_to_cv2(dpt, 'passthrough')
+
+        h_img, w_img = cv_img.shape[:2]
+        h_dpt, w_dpt = cv_dpt.shape[:2]
+
+        cv_img = cv2.resize(cv_img, (self.img_input_size[0], self.img_input_size[1]))
+        cv_dpt = cv2.resize(cv_dpt, (self.img_input_size[0], self.img_input_size[1]))
+        depth_array = np.array(cv_dpt, dtype=np.float32)
+
+        self.points_diam_max = []
+        self.points_diam_min = []
+        self.diam_max = []
+        self.diam_min = []
+
+        self.result_msg.header = img.header
+
+        for number_roi, (y1, x1, y2, x2) in enumerate(result['rois']):
+            # ----- Calculate min length and max length of detected object -----
+            mask_i = result['masks'][:, :, number_roi] * 255  # from mask rcnn (画像中のi番目の物体のマスク情報)
+            h_mask = result['masks'].shape[0]
+            w_mask = result['masks'].shape[1]
+
+            mask_i_01 = np.where(mask_i > 0, 1, 0)  # (mask画像をゼロイチに変換)
+            #print(h_mask, w_mask, mask_i_01.shape) # <- Important
+            depth_in_mask_raw = depth_array * mask_i_01  # (マスク領域内のDepthのみ抽出)
+            depth_in_mask = depth_in_mask_raw[(depth_in_mask_raw > 0) & (depth_in_mask_raw < 10000)]  # (Depthの外れ値を除去)
+            if len(depth_in_mask) == 0:
+                depth_in_mask = np.array([0])  # (Depthが存在しない場合のエラー回避)
+
+            depth_reject_outliers = self.reject_outliers(depth_in_mask)  # (Depthの外れ値の除去)
+            depth_mean = 0
+            if len(depth_reject_outliers) > 0:
+                depth_mean = depth_reject_outliers.mean()
+            else:
+                depth_mean = depth_in_mask.mean()
+
+            mask_i_xy = cv2.resize(mask_i, (self.mask_size4diam[0], self.mask_size4diam[1]))  # 計算軽量化のためサイズ縮小
+
+            # Find the center of gravity (マスク領域の重心計算)
+            label, mask_i_xy_contours, hierarchy = cv2.findContours(mask_i_xy, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+            # https://cvtech.cc/pycvmoment/
+            mu = []
+            if len(mask_i_xy_contours) > 0:
+                maxCont = mask_i_xy_contours[0]
+                mu = cv2.moments(maxCont)
+            cog_x, cog_y = 0, 0  # cog means center of gravity
+            if mu["m00"] > 0:
+                cog_x, cog_y = int(mu["m10"]/mu["m00"]), int(mu["m01"]/mu["m00"])
+
+            # Draw the edge of mask (マスク領域のエッジを描画)
+            # http://labs.eecs.tottori-u.ac.jp/sd/Member/oyamada/OpenCV/html/py_tutorials/py_imgproc/py_contours/py_contours_begin/py_contours_begin.html
+            mask_i_xy_edge = np.zeros((self.mask_size4diam[1], self.mask_size4diam[0], 1), np.uint8)  # ex) [32, 32]
+            mask_i_xy_edge = cv2.drawContours(mask_i_xy_edge, mask_i_xy_contours, -1, 255, 1)
+            mask_i_xy_edge = np.squeeze(mask_i_xy_edge, 2)
+
+            mask_i_xy_edges = np.tile(mask_i_xy_edge, (self.angles/self.angle_step, 1, 1))
+
+            # ----- 2, Multiply array lines and edge of mask at the center of gravity -----
+            range_array_lines_ini = [int(self.mask_size4diam[0] - cog_x), int(self.mask_size4diam[1] - cog_y)]
+            range_array_lines_end = [int(self.mask_size4diam[0] * 2 - cog_x), int(self.mask_size4diam[1] * 2 - cog_y)]
+
+            diameter_points = self.array_lines[:, range_array_lines_ini[1]:range_array_lines_end[1], range_array_lines_ini[0]:range_array_lines_end[0]] * mask_i_xy_edges
+
+            diameters_at_each_angle = []
+            coordinates_at_each_angle = []
+
+            w_magnification = float(self.img_input_size[0]/self.mask_size4diam[0])
+            h_magnification = float(self.img_input_size[1]/self.mask_size4diam[1])
+
+            diameter_points_xy = [np.argwhere(diameter_points[i] > 0) for i in range(len(diameter_points)) if len(np.argwhere(diameter_points[i] > 0)) > 2]
+
+            x_ini = [diameter_points_xy[i][0][1] * w_magnification for i in range(len(diameter_points_xy))]
+            y_ini = [diameter_points_xy[i][0][0] * h_magnification for i in range(len(diameter_points_xy))]
+            x_end = [diameter_points_xy[i][-1][1] * w_magnification for i in range(len(diameter_points_xy))]
+            y_end = [diameter_points_xy[i][-1][0] * h_magnification for i in range(len(diameter_points_xy))]
+
+            diameters_at_each_angle = [math.sqrt((x_ini[i] - x_end[i])**2 + (y_ini[i] - y_end[i])**2) for i in range(len(diameter_points_xy))]
+            coordinates_at_each_angle = [[[int(x_ini[i]), int(y_ini[i])], [int(x_end[i]), int(y_end[i])]] for i in range(len(diameter_points_xy))]
+
+            # ----- 3, Calculate coordinates_max & coordinates_min from diameters_at_each_angle -----
+            if len(diameters_at_each_angle) > 0:
+                diam_max = max(diameters_at_each_angle)
+                diam_min = min(diameters_at_each_angle)
+                coordinates_max = coordinates_at_each_angle[np.argmax(diameters_at_each_angle)]
+                coordinates_min = coordinates_at_each_angle[np.argmin(diameters_at_each_angle)]
+                #print(coordinates_max, coordinates_min)
+            else:
+                diam_max = 0
+                diam_min = 0
+                coordinates_max = np.array([0, 0])
+                coordinates_min = np.array([0, 0])
+
+            self.points_diam_max.append(coordinates_max)
+            diam_max_real = int(diam_max * depth_mean/(self.ratio_resize_input * self.fx))
+            self.diam_max.append(diam_max_real)
+            self.points_diam_min.append(coordinates_min)
+            diam_min_real = int(diam_min * depth_mean/(self.ratio_resize_input * self.fx))
+            self.diam_min.append(diam_min_real)
+
+            # Publish result topic
+            self.build_result_msg_each_roi(img, result, number_roi, y1, x1, y2, x2, diam_max_real, coordinates_max, diam_min_real, coordinates_min)
+            self.pub_result.publish(self.result_msg)
+        #print(len(self.diam_max), len(self.diam_min))
+
+    def publish_visualization(self, np_image, result):
+        if rospy.get_param('~visualization', True):
+            vis_image = self.visualize(result, np_image)
+
+            cv_result = np.zeros(shape=vis_image.shape, dtype=np.uint8)
+
+            cv2.convertScaleAbs(vis_image, cv_result)
+            image_msg = CvBridge().cv2_to_imgmsg(cv_result, 'bgr8')
+            self.pub_visualize.publish(image_msg)
+
+    def visualize(self, result, image):
+        fig = Figure()
+        canvas = FigureCanvasAgg(fig)
+        axes = fig.gca()
+        visualize.display_instances(image, result['rois'], result['masks'],
+                                    self.points_diam_max, self.diam_max,
+                                    self.points_diam_min, self.diam_min,
+                                    result['class_ids'], self.class_names,
+                                    result['scores'], ax=axes,
+                                    class_colors=self.class_colors)
+        fig.tight_layout()
+        canvas.draw()
+        result_image = np.fromstring(canvas.tostring_rgb(), dtype='uint8')
+
+        _, _, w, h = fig.bbox.bounds
+        result_image = result_image.reshape((int(h), int(w), 3))
+        return result_image
+
+
+def main():
+    rospy.init_node('mrcnn_measurement')
+
+    node = MaskRCNNNode()
+    try:
+        rospy.spin()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == '__main__':
+    main()
