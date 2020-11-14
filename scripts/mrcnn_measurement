@@ -43,10 +43,8 @@ from matplotlib.figure import Figure
 
 # Root directory of the project
 ROOT_DIR = os.path.abspath("../")
-print(ROOT_DIR)
 # Import Mask RCNN
 sys.path.append(ROOT_DIR)  # To find local version of the library
-print(sys.path)
 
 from mrcnn_measurement import coco
 from mrcnn_measurement import utils

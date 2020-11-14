@@ -1,0 +1,13 @@
+<launch>
+    <node name="bag" pkg="rosbag" type="play"
+        args="-l $(find mrcnn_measurement)/rosbag/snappeas1_sample.bag" />
+
+    <node name="mrcnn_measurement" pkg="mrcnn_measurement" type="mrcnn_measurement" output="screen">
+        <!--<param name="~model" value="mymodel" />-->
+        <param name="~model" value="mymodel" />
+        <param name="~img_sensor_size_0" type="int" value="640" />
+        <param name="~img_sensor_size_1" type="int" value="480" />
+        <param name="~fx" type="double" value="613.3497314453125" />
+
+    </node>
+</launch>
