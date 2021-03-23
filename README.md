@@ -2,6 +2,12 @@
 Measurement of  max &amp; min diameters of inferenced objects by Mask RCNN
 Recommended sensor : RealSense D435  
 ## Usage :  
+Notice! If you get an error by executing download_files.sh, please download from under URLs.
+https://drive.google.com/file/d/1jDSxzqlHILCcwQGtHmI43A78a8lG1hSb/view?usp=sharing
+https://drive.google.com/file/d/1rrKQBYAzL9TwhA3B7sgVlmE0XPD2Ji8f/view?usp=sharing
+https://drive.google.com/file/d/1p6egLmlxAb4cv7UfUwLtZ0oZxJkFhBhs/view?usp=sharing
+https://drive.google.com/file/d/1710BCuNIz8KxsLGuOWHk0Z8VsHMvR1iO/view?usp=sharing
+
 (0, sh download_files.sh) <= First time only  
 1, roslaunch realsense2_camera rs_aligned_depth.launch  
 2, roslaunch mrcnn_measurement mrcnn_measurement.launch  
